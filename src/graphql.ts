@@ -1,4 +1,5 @@
 import { ApolloClient, ApolloLink, InMemoryCache, gql } from '@apollo/client/core';
+import type { PlanStateDTO } from './offline/types';
 
 export const LIFT_PLAN_QUERY = gql`
   query LiftPlan($id: ID!) {
@@ -9,9 +10,23 @@ export const LIFT_PLAN_QUERY = gql`
       status
       steps {
         id
-        name
+        title
+        time
         loadRate
         clearance
+        wind
+        radius
+        boom
+        status
+        note
+      }
+      comments {
+        id
+        author
+        role
+        content
+        status
+        stepId
       }
     }
   }
@@ -22,17 +37,29 @@ export const graphqlClient = new ApolloClient({
   link: ApolloLink.empty()
 });
 
-graphqlClient.writeQuery({
-  query: LIFT_PLAN_QUERY,
-  variables: { id: 'LP-2026-0918' },
-  data: {
-    liftPlan: {
-      __typename: 'LiftPlan',
-      id: 'LP-2026-0918',
-      name: '东塔转换桁架吊装',
-      revision: 4,
-      status: 'REVIEW',
-      steps: []
+/** 方案快照：每次合并对齐后整体写入，快照版本与步骤/冲突/就绪度指向同一版本。 */
+export function writePlanSnapshot(plan: PlanStateDTO, snapshotId?: string): void {
+  graphqlClient.writeQuery({
+    query: LIFT_PLAN_QUERY,
+    variables: { id: plan.id },
+    data: {
+      liftPlan: {
+        __typename: 'LiftPlan',
+        id: plan.id,
+        name: plan.name,
+        revision: plan.revision,
+        status: plan.status,
+        steps: plan.steps.map((step) => ({ __typename: 'LiftStep', ...step })),
+        comments: plan.comments.map((comment) => ({ __typename: 'PlanComment', ...comment }))
+      }
     }
+  });
+  if (typeof localStorage !== 'undefined') {
+    localStorage.setItem('yy58-lift-plan-snapshot', JSON.stringify({ snapshotId, revision: plan.revision, savedAt: new Date().toISOString() }));
   }
-});
+}
+
+export function readSnapshotMeta(): { snapshotId?: string; revision?: number } {
+  const raw = typeof localStorage !== 'undefined' ? localStorage.getItem('yy58-lift-plan-snapshot') : null;
+  return raw ? JSON.parse(raw) : {};
+}

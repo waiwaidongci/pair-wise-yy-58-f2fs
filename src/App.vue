@@ -1,15 +1,21 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
+import { useQuasar } from 'quasar';
 import * as THREE from 'three';
 import { useLiftStore } from './store';
+import { FIELD_LABELS } from './offline/types';
+import type { StepField, StepParams } from './offline/types';
+
+const SyncCenter = defineAsyncComponent(() => import('./pages/SyncCenter.vue'));
 
 const route = useRoute();
 const router = useRouter();
 const store = useLiftStore();
+const $q = useQuasar();
 const canvasRef = ref<HTMLCanvasElement | null>(null);
-const commentText = ref('');
 const sceneContainer = ref<HTMLElement | null>(null);
+const commentText = ref('');
 let renderer: THREE.WebGLRenderer | null = null;
 let frame = 0;
 let resizeObserver: ResizeObserver | null = null;
@@ -22,7 +28,8 @@ const nav = [
   { path: '/', label: '三维复核', icon: 'view_in_ar' },
   { path: '/models', label: '模型与参数', icon: 'tune' },
   { path: '/checks', label: '冲突与评论', icon: 'rule' },
-  { path: '/review', label: '多角色会签', icon: 'fact_check' }
+  { path: '/review', label: '多角色会签', icon: 'fact_check' },
+  { path: '/sync', label: '离线同步', icon: 'sync' }
 ];
 
 const pageTitle = computed(() => nav.find((item) => item.path === route.path)?.label ?? '吊装工作台');
@@ -35,9 +42,71 @@ function severityLabel(severity: string) {
   return severity === 'high' ? '阻断' : '预警';
 }
 
+function toast(message: string) {
+  $q.notify({ message, color: store.lastMessageTone === 'negative' ? 'negative' : store.lastMessageTone === 'warning' ? 'warning' : store.lastMessageTone === 'positive' ? 'positive' : 'dark', position: 'top-right' });
+}
+
+watch(
+  () => store.lastMessage,
+  (message) => {
+    if (message) toast(message);
+  }
+);
+
+// ---------- 检查器本地表单：编辑在本机，保存时才进入离线批次 ----------
+const form = reactive<StepParams>({ ...store.selectedStep });
+
+function loadForm(step: StepParams) {
+  Object.assign(form, step);
+}
+watch(
+  () => store.selectedStepId,
+  () => loadForm(store.selectedStep)
+);
+watch(
+  () => store.steps,
+  () => loadForm(store.selectedStep),
+  { deep: true }
+);
+
+const dirtyFields = computed<StepField[]>(() => {
+  const current = store.selectedStep;
+  return (['time', 'loadRate', 'clearance', 'wind', 'radius', 'boom', 'status', 'note'] as StepField[]).filter(
+    (field) => String(form[field]) !== String(current[field])
+  );
+});
+
+function baselineOf(field: StepField): string {
+  const batch = store.activeBatch;
+  const base = batch?.baselineSteps.find((step) => step.id === store.selectedStepId);
+  if (base) return String(base[field]);
+  return String(store.selectedStep[field]);
+}
+
+function saveForm() {
+  store.saveStep(store.selectedStepId, {
+    time: form.time,
+    loadRate: Number(form.loadRate),
+    clearance: Number(form.clearance),
+    wind: Number(form.wind),
+    radius: Number(form.radius),
+    boom: Number(form.boom),
+    status: form.status,
+    note: form.note
+  });
+  loadForm(store.selectedStep);
+}
+
 function submitComment() {
   store.addComment(commentText.value);
   commentText.value = '';
+}
+
+function reviewerStateLabel(state: string) {
+  return state === 'accepted' ? '已接受' : state === 'reserved' ? '有保留' : '待确认';
+}
+function reviewerStateColor(state: string) {
+  return state === 'accepted' ? 'positive' : state === 'reserved' ? 'warning' : 'grey';
 }
 
 function initializeScene() {
@@ -157,6 +226,7 @@ function initializeScene() {
 }
 
 onMounted(() => {
+  store.startup();
   nextTick(initializeScene);
 });
 
@@ -164,6 +234,7 @@ onBeforeUnmount(() => {
   cancelAnimationFrame(frame);
   resizeObserver?.disconnect();
   renderer?.dispose();
+  store.clearRetry();
 });
 </script>
 
@@ -174,13 +245,32 @@ onBeforeUnmount(() => {
         <div class="brand-mark">LIFT</div>
         <div class="brand-copy">
           <strong>大型构件吊装三维校核</strong>
-          <span>东塔转换桁架 · 方案版本 V{{ store.revision }}</span>
+          <span>
+            本地 V{{ store.workingRevision }} · 服务端 V{{ store.serverMeta.revision }} ·
+            {{ store.locked ? '已锁定发布' : '会签中' }}
+          </span>
         </div>
         <q-space />
-        <q-badge :color="store.locked ? 'teal' : 'orange'" outline class="status-badge">
-          {{ store.locked ? '已锁定发布' : '会签中' }}
+        <q-btn-toggle
+          :model-value="store.online ? 'online' : 'offline'"
+          spread
+          no-caps
+          dense
+          toggle-color="primary"
+          color="grey-8"
+          :options="[
+            { label: '联网', value: 'online' },
+            { label: '断网', value: 'offline' }
+          ]"
+          @update:model-value="(v) => store.setOnline(v === 'online')"
+        />
+        <q-badge :color="store.online ? 'teal' : 'orange'" outline class="status-badge">
+          <q-icon :name="store.online ? 'cloud_done' : 'cloud_off'" size="12px" />{{ store.online ? '在线' : '离线' }}
         </q-badge>
-        <q-btn dense flat round icon="notifications" aria-label="通知">
+        <q-badge v-if="store.pendingBatches.length" color="deep-orange" class="status-badge">
+          {{ store.pendingBatches.length }} 个批次待同步
+        </q-badge>
+        <q-btn dense flat round icon="notifications" aria-label="通知" @click="go('/sync')">
           <q-badge floating color="red">{{ store.openComments.length }}</q-badge>
         </q-btn>
       </q-toolbar>
@@ -202,16 +292,42 @@ onBeforeUnmount(() => {
           <q-item-section v-if="item.path === '/checks'" side>
             <q-badge color="negative">{{ store.conflicts.length }}</q-badge>
           </q-item-section>
+          <q-item-section v-else-if="item.path === '/sync' && store.pendingBatches.length" side>
+            <q-badge color="deep-orange">{{ store.pendingBatches.length }}</q-badge>
+          </q-item-section>
         </q-item>
       </q-list>
-      <div class="draft-state">
-        <q-icon name="cloud_done" color="teal" />
-        <span>草稿已自动保存<br /><small>{{ new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) }}</small></span>
+      <div class="draft-state" :class="{ offline: !store.online }">
+        <q-icon :name="store.online ? 'cloud_done' : 'cloud_off'" :color="store.online ? 'teal' : 'orange'" />
+        <span>
+          {{ store.online ? '草稿已自动保存' : '离线草稿本机保存中' }}<br />
+          <small>{{ store.deviceName }} · {{ store.currentUser }}</small>
+        </span>
       </div>
     </q-drawer>
 
     <q-page-container>
       <q-page class="workspace-page">
+        <!-- 全局横幅 -->
+        <q-banner v-if="!store.online" class="offline-banner" rounded>
+          <template #avatar><q-icon name="cloud_off" color="orange-9" /></template>
+          平板处于断网状态：步骤参数与意见改动会写入离线批次，记录基线版本、修改人和字段值；回到办公室联网后再合并。
+        </q-banner>
+        <q-banner v-if="store.draftRecovered && store.online" class="recover-banner" rounded>
+          <template #avatar><q-icon name="restore" color="blue-9" /></template>
+          已从本机找回未完成离线批次，待同步内容仍在。
+          <template #action>
+            <q-btn flat no-caps label="去同步" @click="go('/sync')" />
+          </template>
+        </q-banner>
+        <q-banner v-if="!store.signOff.valid && store.signOff.invalidatedAt" class="invalid-banner" rounded>
+          <template #avatar><q-icon name="gpp_bad" color="red-10" /></template>
+          原会签结论已失效：{{ store.signOff.reason }}。相关意见已重新打开，需重新会签。
+          <template #action>
+            <q-btn flat no-caps label="查看看法" @click="go('/review')" />
+          </template>
+        </q-banner>
+
         <header class="page-heading">
           <div>
             <div class="eyebrow">LP-2026-0918 / {{ pageTitle }}</div>
@@ -219,7 +335,14 @@ onBeforeUnmount(() => {
           </div>
           <div class="heading-actions">
             <q-btn outline no-caps icon="ios_share" label="导出吊装指令" />
-            <q-btn color="primary" no-caps icon="lock" :label="store.locked ? '版本已锁定' : '确认并锁定'" :disable="store.locked || store.conflicts.length > 0 || store.openComments.length > 0" @click="store.lockPlan" />
+            <q-btn
+              color="primary"
+              no-caps
+              icon="lock"
+              :label="store.locked ? '版本已锁定' : '确认并锁定'"
+              :disable="store.locked || store.conflicts.length > 0 || store.openComments.length > 0 || !!store.activeBatch"
+              @click="store.lockPlan()"
+            />
           </div>
         </header>
 
@@ -252,7 +375,7 @@ onBeforeUnmount(() => {
             </div>
             <div class="timeline">
               <button
-                v-for="(step, index) in store.steps"
+                v-for="step in store.steps"
                 :key="step.id"
                 class="timeline-step"
                 :class="[step.status, { selected: store.selectedStepId === step.id }]"
@@ -268,9 +391,12 @@ onBeforeUnmount(() => {
           <aside class="inspector-panel content-panel">
             <div class="panel-heading compact">
               <div>
-                <span class="panel-kicker">STEP INSPECTOR</span>
+                <span class="panel-kicker">STEP INSPECTOR · 基线 V{{ store.activeBatch?.baseRevision ?? store.workingRevision }}</span>
                 <h2>{{ store.selectedStep.id }} · {{ store.selectedStep.title }}</h2>
               </div>
+              <q-badge v-if="store.activeBatch" color="deep-orange" outline>
+                本批已改 {{ store.activeBatch.changes.length }} 项
+              </q-badge>
             </div>
             <div class="metric-grid">
               <div><span>荷载率</span><strong :class="{ danger: store.selectedStep.loadRate > 90 }">{{ store.selectedStep.loadRate }}%</strong></div>
@@ -278,33 +404,60 @@ onBeforeUnmount(() => {
               <div><span>作业半径</span><strong>{{ store.selectedStep.radius }}m</strong></div>
               <div><span>风速限制</span><strong>{{ store.selectedStep.wind }}m/s</strong></div>
             </div>
-            <label class="field-label">荷载率</label>
-            <q-slider v-model="store.selectedStep.loadRate" :min="0" :max="120" color="primary" />
+
+            <div v-if="dirtyFields.length" class="dirty-hint">
+              <q-icon name="edit_note" size="15px" />
+              待入批：{{ dirtyFields.map((f) => FIELD_LABELS[f]).join('、') }}
+            </div>
+
+            <label class="field-label">
+              荷载率 <small class="baseline-hint">基线 {{ baselineOf('loadRate') }}%</small>
+              <q-badge v-if="store.isFieldLocked(store.selectedStepId, 'loadRate')" color="negative" dense class="lock-badge"><q-icon name="lock" size="10px" />会签锁定</q-badge>
+            </label>
+            <q-slider v-model="form.loadRate" :min="0" :max="120" color="primary" :disable="store.isFieldLocked(store.selectedStepId, 'loadRate')" />
             <div class="form-row">
-              <q-input v-model.number="store.selectedStep.clearance" type="number" label="最小净空 / m" outlined dense />
-              <q-input v-model.number="store.selectedStep.wind" type="number" label="风速 / m/s" outlined dense />
+              <q-input v-model.number="form.clearance" type="number" label="最小净空 / m" outlined dense hint="基线值影响合并后风险重算" :disable="store.isFieldLocked(store.selectedStepId, 'clearance')">
+                <template v-if="store.isFieldLocked(store.selectedStepId, 'clearance')" append><q-icon name="lock" color="negative" /></template>
+              </q-input>
+              <q-input v-model.number="form.wind" type="number" label="风速 / m/s" outlined dense :disable="store.isFieldLocked(store.selectedStepId, 'wind')">
+                <template v-if="store.isFieldLocked(store.selectedStepId, 'wind')" append><q-icon name="lock" color="negative" /></template>
+              </q-input>
+            </div>
+            <div class="form-row">
+              <q-input v-model.number="form.radius" type="number" label="作业半径 / m" outlined dense :disable="store.isFieldLocked(store.selectedStepId, 'radius')" />
+              <q-input v-model.number="form.boom" type="number" label="臂长 / m" outlined dense :disable="store.isFieldLocked(store.selectedStepId, 'boom')" />
+            </div>
+            <div class="form-row">
+              <q-input v-model="form.time" type="time" label="开始时间" outlined dense mask="HH:mm" :disable="store.isFieldLocked(store.selectedStepId, 'time')" />
             </div>
             <label class="field-label">步骤结论</label>
             <q-btn-toggle
-              v-model="store.selectedStep.status"
+              v-model="form.status"
               spread
               no-caps
               toggle-color="primary"
+              :disable="store.isFieldLocked(store.selectedStepId, 'status')"
               :options="[
                 { label: '待复核', value: 'pending' },
                 { label: '通过', value: 'passed' },
                 { label: '阻断', value: 'blocked' }
               ]"
             />
-            <q-input v-model="store.selectedStep.note" type="textarea" autogrow outlined label="现场控制说明" class="note-input" />
-            <q-btn class="save-step" color="primary" no-caps icon="save" label="保存步骤修改" @click="store.updateStep({})" />
+            <q-input v-model="form.note" type="textarea" autogrow outlined label="现场控制说明" class="note-input" :disable="store.isFieldLocked(store.selectedStepId, 'note')" />
+            <q-btn class="save-step" color="primary" no-caps icon="save" :label="`保存到${store.online ? '同步' : '离线'}批次`" @click="saveForm" />
+            <div class="inspector-foot">
+              <q-icon :name="store.online ? 'cloud_queue' : 'save'" size="14px" />
+              <span>
+                每项改动记录基线版本、修改人（{{ store.currentUser }}）与字段值；同一字段重复修改只更新现场值。
+              </span>
+            </div>
           </aside>
         </section>
 
         <section v-if="route.path === '/checks'" class="content-panel full-panel">
           <div class="panel-heading">
             <div>
-              <span class="panel-kicker">RULE ENGINE</span>
+              <span class="panel-kicker">RULE ENGINE · V{{ store.workingRevision }}</span>
               <h2>冲突定位与条件清单</h2>
             </div>
             <q-badge color="negative">{{ store.conflicts.length }} 项待处理</q-badge>
@@ -320,16 +473,19 @@ onBeforeUnmount(() => {
             </div>
             <div class="comments-panel">
               <h3>条件与评论 · {{ store.selectedStep.id }}</h3>
-              <div v-for="comment in store.comments.filter(c => c.stepId === store.selectedStepId)" :key="comment.id" class="comment-row">
+              <div v-for="comment in store.comments.filter((c) => c.stepId === store.selectedStepId)" :key="comment.id" class="comment-row">
                 <div class="comment-avatar">{{ comment.author.slice(0, 1) }}</div>
                 <div>
                   <strong>{{ comment.author }} <small>{{ comment.role }}</small></strong>
                   <p>{{ comment.content }}</p>
+                  <div v-if="comment.reopenedReason" class="reopened-tag">
+                    <q-icon name="history" size="12px" /> {{ comment.reopenedReason }}
+                  </div>
                   <button v-if="comment.status === 'open'" @click="store.resolveComment(comment.id)">标记已解决</button>
                   <span v-else class="resolved">已解决</span>
                 </div>
               </div>
-              <q-input v-model="commentText" type="textarea" outlined autogrow label="对该步骤提出条件或补充意见" />
+              <q-input v-model="commentText" type="textarea" outlined autogrow label="对该步骤提出条件或补充意见（断网也可提交）" />
               <q-btn color="primary" no-caps icon="send" label="提交意见" @click="submitComment" />
             </div>
           </div>
@@ -338,33 +494,47 @@ onBeforeUnmount(() => {
         <section v-if="route.path === '/review'" class="content-panel full-panel">
           <div class="panel-heading">
             <div>
-              <span class="panel-kicker">MULTI-PARTY SIGN-OFF</span>
+              <span class="panel-kicker">MULTI-PARTY SIGN-OFF · V{{ store.workingRevision }}</span>
               <h2>多角色会签与发布门禁</h2>
             </div>
             <div class="readiness"><strong>{{ store.readiness }}%</strong><span>发布就绪度</span></div>
           </div>
+          <q-banner v-if="!store.signOff.valid && store.signOff.invalidatedAt" class="inline-invalid" dense rounded>
+            <template #avatar><q-icon name="warning" color="red-10" /></template>
+            V{{ store.signOff.revision }} 的会签结论因合并后新风险失效，相关意见已重新打开，需要重新完成会签。
+          </q-banner>
           <div class="review-grid">
-            <article v-for="person in [
-              { name: '陈晓', team: '总包项目部', scope: '吊装工序与场地移交', state: '已接受' },
-              { name: '刘明', team: '设备管理', scope: '吊车参数与支腿地基', state: '待确认' },
-              { name: '周工', team: '安全监督', scope: '净空、风速与警戒区', state: '有保留' },
-              { name: '赵磊', team: '方案工程', scope: '载荷计算与路径参数', state: '待确认' }
-            ]" :key="person.name" class="review-card">
-              <div class="review-head"><strong>{{ person.name }}</strong><q-badge :color="person.state === '已接受' ? 'positive' : person.state === '有保留' ? 'warning' : 'grey'">{{ person.state }}</q-badge></div>
+            <article v-for="person in store.reviewers" :key="person.id" class="review-card">
+              <div class="review-head">
+                <strong>{{ person.name }}</strong>
+                <q-badge :color="reviewerStateColor(person.state)">{{ reviewerStateLabel(person.state) }}</q-badge>
+              </div>
               <span>{{ person.team }}</span>
               <p>{{ person.scope }}</p>
-              <q-btn v-if="person.state !== '已接受'" outline no-caps label="接受方案" />
+              <q-btn v-if="person.state !== 'accepted'" outline no-caps label="接受方案" />
               <q-btn v-else disable no-caps label="已签署" />
             </article>
           </div>
           <div class="release-gate">
             <div>
               <q-icon name="verified_user" size="30px" />
-              <div><strong>发布前门禁</strong><span>要求冲突清零、意见全部关闭、四个角色完成签署。</span></div>
+              <div>
+                <strong>发布前门禁</strong>
+                <span>要求冲突清零、意见全部关闭、离线批次全部合并、四个角色完成签署。</span>
+              </div>
             </div>
-            <q-btn color="primary" no-caps icon="lock" label="锁定并发布 V{{ store.revision + 1 }}" :disable="store.conflicts.length > 0 || store.openComments.length > 0" @click="store.lockPlan" />
+            <q-btn
+              color="primary"
+              no-caps
+              icon="lock"
+              label="锁定并发布 V{{ store.serverMeta.revision + 1 }}"
+              :disable="store.conflicts.length > 0 || store.openComments.length > 0 || !!store.activeBatch"
+              @click="store.lockPlan()"
+            />
           </div>
         </section>
+
+        <SyncCenter v-if="route.path === '/sync'" />
       </q-page>
     </q-page-container>
   </q-layout>

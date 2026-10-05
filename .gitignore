@@ -1,0 +1,5 @@
+node_modules/
+dist/
+scripts/*.mjs
+.DS_Store
+*.local
