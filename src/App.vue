@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import * as THREE from 'three';
 import { useLiftStore } from './store';
@@ -10,6 +10,7 @@ const store = useLiftStore();
 const canvasRef = ref<HTMLCanvasElement | null>(null);
 const commentText = ref('');
 const sceneContainer = ref<HTMLElement | null>(null);
+const syncCenterOpen = ref(false);
 let renderer: THREE.WebGLRenderer | null = null;
 let frame = 0;
 let resizeObserver: ResizeObserver | null = null;
@@ -27,6 +28,8 @@ const nav = [
 
 const pageTitle = computed(() => nav.find((item) => item.path === route.path)?.label ?? '吊装工作台');
 
+const pendingCount = computed(() => store.pendingBatches.length + store.openFieldConflicts.length);
+
 function go(path: string) {
   router.push(path);
 }
@@ -39,6 +42,84 @@ function submitComment() {
   store.addComment(commentText.value);
   commentText.value = '';
 }
+
+function resolveConflict(conflictId: string, resolution: 'local' | 'server') {
+  store.resolveFieldConflict(conflictId, resolution);
+}
+
+function fieldConflictTitle(conflict: { stepId: string; field: string }) {
+  const step = store.steps.find((s) => s.id === conflict.stepId);
+  const fieldLabels: Record<string, string> = {
+    loadRate: '荷载率',
+    clearance: '净空',
+    wind: '风速',
+    radius: '作业半径',
+    boom: '臂长',
+    status: '步骤结论',
+    note: '现场控制说明'
+  };
+  return `${step?.title ?? conflict.stepId} · ${fieldLabels[conflict.field] ?? conflict.field}`;
+}
+
+function formatValue(value: number | string) {
+  if (typeof value === 'number') return `${value}`;
+  return value;
+}
+
+function statusLabel(status: string) {
+  const map: Record<string, string> = {
+    pending: '待同步',
+    syncing: '同步中',
+    conflict: '待处理冲突',
+    failed: '同步失败',
+    synced: '已同步'
+  };
+  return map[status] ?? status;
+}
+
+function statusColor(status: string) {
+  const map: Record<string, string> = {
+    pending: 'orange',
+    syncing: 'blue',
+    conflict: 'red',
+    failed: 'red',
+    synced: 'teal'
+  };
+  return map[status] ?? 'grey';
+}
+
+function onOnline() {
+  store.setOnline(true);
+}
+function onOffline() {
+  store.setOnline(false);
+}
+
+// 步骤改动写入离线批次（断网排队、联网逐字段合并）
+watch(
+  () => store.steps,
+  () => {
+    if (store.syncing) return;
+    store.recordChanges();
+    if (store.effectiveOnline) void store.syncAll();
+  },
+  { deep: true }
+);
+
+onMounted(() => {
+  nextTick(initializeScene);
+  window.addEventListener('online', onOnline);
+  window.addEventListener('offline', onOffline);
+  if (store.effectiveOnline) void store.syncAll();
+});
+
+onBeforeUnmount(() => {
+  cancelAnimationFrame(frame);
+  resizeObserver?.disconnect();
+  renderer?.dispose();
+  window.removeEventListener('online', onOnline);
+  window.removeEventListener('offline', onOffline);
+});
 
 function initializeScene() {
   if (!canvasRef.value || !sceneContainer.value) return;
@@ -155,16 +236,6 @@ function initializeScene() {
     dragging = false;
   };
 }
-
-onMounted(() => {
-  nextTick(initializeScene);
-});
-
-onBeforeUnmount(() => {
-  cancelAnimationFrame(frame);
-  resizeObserver?.disconnect();
-  renderer?.dispose();
-});
 </script>
 
 <template>
@@ -177,6 +248,20 @@ onBeforeUnmount(() => {
           <span>东塔转换桁架 · 方案版本 V{{ store.revision }}</span>
         </div>
         <q-space />
+        <q-btn
+          dense
+          :flat="!store.hasPendingSync"
+          :color="store.effectiveOnline ? 'teal' : 'orange'"
+          no-caps
+          icon="sync"
+          :label="store.effectiveOnline ? '在线' : '离线'"
+          @click="syncCenterOpen = true"
+        >
+          <q-badge v-if="pendingCount > 0" floating color="red">{{ pendingCount }}</q-badge>
+        </q-btn>
+        <q-btn dense flat round :icon="store.forceOffline ? 'cloud_off' : 'cloud'" aria-label="切换离线模式" @click="store.toggleForceOffline()">
+          <q-tooltip>{{ store.forceOffline ? '当前强制离线，点击恢复联网' : '模拟断网（离线变更将排队）' }}</q-tooltip>
+        </q-btn>
         <q-badge :color="store.locked ? 'teal' : 'orange'" outline class="status-badge">
           {{ store.locked ? '已锁定发布' : '会签中' }}
         </q-badge>
@@ -307,8 +392,26 @@ onBeforeUnmount(() => {
               <span class="panel-kicker">RULE ENGINE</span>
               <h2>冲突定位与条件清单</h2>
             </div>
-            <q-badge color="negative">{{ store.conflicts.length }} 项待处理</q-badge>
+            <q-badge color="negative">{{ store.conflicts.length }} 项规则冲突 · {{ store.openFieldConflicts.length }} 项字段冲突</q-badge>
           </div>
+
+          <div v-if="store.openFieldConflicts.length > 0" class="field-conflict-strip">
+            <div class="strip-head">
+              <q-icon name="sync_problem" color="red" />
+              <strong>离线字段合并冲突（需选择后才能入库）</strong>
+            </div>
+            <div v-for="conflict in store.openFieldConflicts" :key="conflict.id" class="strip-item">
+              <div class="strip-info">
+                <strong>{{ fieldConflictTitle(conflict) }}</strong>
+                <small>基线 {{ formatValue(conflict.baseValue) }} · 本地 {{ formatValue(conflict.localValue) }} · 远端 {{ formatValue(conflict.serverValue) }}</small>
+              </div>
+              <div class="strip-actions">
+                <q-btn size="xs" outline color="primary" no-caps label="采用本地" @click="resolveConflict(conflict.id, 'local')" />
+                <q-btn size="xs" outline color="primary" no-caps label="采用远端" @click="resolveConflict(conflict.id, 'server')" />
+              </div>
+            </div>
+          </div>
+
           <div class="check-layout">
             <div class="conflict-list">
               <button v-for="item in store.conflicts" :key="item.id" class="conflict-item" @click="store.selectStep(item.stepId)">
@@ -343,17 +446,21 @@ onBeforeUnmount(() => {
             </div>
             <div class="readiness"><strong>{{ store.readiness }}%</strong><span>发布就绪度</span></div>
           </div>
+
+          <div v-if="store.invalidated" class="invalidated-banner review-banner">
+            <q-icon name="warning" color="warning" />
+            <div>
+              <strong>原会签结论已失效</strong>
+              <span>净空或荷载率因合并变化产生新风险，相关意见已重新打开，签署角色已回到待确认。</span>
+            </div>
+          </div>
+
           <div class="review-grid">
-            <article v-for="person in [
-              { name: '陈晓', team: '总包项目部', scope: '吊装工序与场地移交', state: '已接受' },
-              { name: '刘明', team: '设备管理', scope: '吊车参数与支腿地基', state: '待确认' },
-              { name: '周工', team: '安全监督', scope: '净空、风速与警戒区', state: '有保留' },
-              { name: '赵磊', team: '方案工程', scope: '载荷计算与路径参数', state: '待确认' }
-            ]" :key="person.name" class="review-card">
-              <div class="review-head"><strong>{{ person.name }}</strong><q-badge :color="person.state === '已接受' ? 'positive' : person.state === '有保留' ? 'warning' : 'grey'">{{ person.state }}</q-badge></div>
+            <article v-for="person in store.signoffs" :key="person.id" class="review-card">
+              <div class="review-head"><strong>{{ person.name }}</strong><q-badge :color="person.state === 'accepted' ? 'positive' : person.state === 'reserved' ? 'warning' : 'grey'">{{ person.state === 'accepted' ? '已接受' : person.state === 'reserved' ? '有保留' : '待确认' }}</q-badge></div>
               <span>{{ person.team }}</span>
               <p>{{ person.scope }}</p>
-              <q-btn v-if="person.state !== '已接受'" outline no-caps label="接受方案" />
+              <q-btn v-if="person.state !== 'accepted'" outline no-caps label="接受方案" @click="store.setSignoffState(person.id, 'accepted')" />
               <q-btn v-else disable no-caps label="已签署" />
             </article>
           </div>
@@ -367,5 +474,89 @@ onBeforeUnmount(() => {
         </section>
       </q-page>
     </q-page-container>
+
+    <q-dialog v-model="syncCenterOpen" persistent>
+      <q-card class="sync-dialog">
+        <q-card-section class="sync-dialog-header">
+          <div>
+            <div class="panel-kicker">OFFLINE SYNC CENTER</div>
+            <h3>离线变更同步中心</h3>
+          </div>
+          <q-btn dense flat round icon="close" @click="syncCenterOpen = false" />
+        </q-card-section>
+        <q-card-section class="sync-dialog-body">
+          <div class="sync-toolbar">
+            <div class="sync-status-line">
+              <q-icon :name="store.effectiveOnline ? 'cloud_done' : 'cloud_off'" :color="store.effectiveOnline ? 'teal' : 'orange'" />
+              <span>{{ store.effectiveOnline ? '已联网，变更将逐字段合并到当前锁定版本' : '离线中，变更将排队待联网后同步' }}</span>
+            </div>
+            <div class="sync-toolbar-actions">
+              <q-btn size="sm" outline no-caps icon="sync" label="立即同步" :disable="!store.effectiveOnline || store.syncing || store.pendingBatches.length === 0" @click="store.syncAll()" />
+              <q-btn size="sm" outline no-caps icon="cloud_download" label="模拟远端变更" @click="store.simulateRemoteChange()" />
+            </div>
+          </div>
+
+          <div v-if="store.invalidated" class="invalidated-banner">
+            <q-icon name="warning" color="warning" />
+            <div>
+              <strong>原会签结论已失效</strong>
+              <span>净空或荷载率因合并变化产生新风险，相关意见已重新打开，就绪度已重置。</span>
+            </div>
+          </div>
+
+          <h4 class="sync-section-title">待同步批次</h4>
+          <div v-if="store.batches.length === 0" class="empty-state">暂无离线变更批次。断网后修改步骤参数即会在此生成批次。</div>
+          <div v-for="batch in store.batches" :key="batch.id" class="batch-card">
+            <div class="batch-head">
+              <div>
+                <strong>{{ batch.id }}</strong>
+                <small>{{ batch.createdBy }} · 基线 V{{ batch.baselineRevision }} · {{ new Date(batch.createdAt).toLocaleString('zh-CN') }}</small>
+              </div>
+              <q-badge :color="statusColor(batch.status)">{{ statusLabel(batch.status) }}</q-badge>
+            </div>
+            <div v-if="batch.lastError" class="batch-error">
+              <q-icon name="error" color="red" size="14px" />
+              <span>同步失败：{{ batch.lastError }}（第 {{ batch.retryCount }} 次重试）</span>
+            </div>
+            <div class="batch-fields">
+              <div v-for="change in batch.changes" :key="change.stepId" class="batch-step">
+                <span class="batch-step-id">{{ change.stepId }}</span>
+                <span v-for="field in change.fields" :key="field.id" class="batch-field" :class="{ synced: field.synced }">
+                  {{ field.field }}: {{ formatValue(field.baseValue) }} → <strong>{{ formatValue(field.localValue) }}</strong>
+                  <q-icon v-if="field.synced" name="check_circle" color="teal" size="13px" />
+                </span>
+              </div>
+            </div>
+            <div class="batch-actions">
+              <q-btn v-if="batch.status === 'failed'" size="xs" color="primary" no-caps icon="refresh" label="重试" @click="store.retryBatch(batch.id)" />
+              <span v-if="batch.syncedAt" class="batch-synced-at">已于 {{ new Date(batch.syncedAt).toLocaleTimeString('zh-CN') }} 同步</span>
+            </div>
+          </div>
+
+          <h4 class="sync-section-title">字段冲突（需选择）</h4>
+          <div v-if="store.fieldConflicts.length === 0" class="empty-state">联网合并时若双方改过同一字段，将在此列出供选择。</div>
+          <div v-for="conflict in store.fieldConflicts" :key="conflict.id" class="conflict-card" :class="{ resolved: conflict.status === 'resolved' }">
+            <div class="conflict-head">
+              <strong>{{ fieldConflictTitle(conflict) }}</strong>
+              <q-badge v-if="conflict.status === 'open'" color="red">待选择</q-badge>
+              <q-badge v-else color="teal">已选择{{ conflict.resolution === 'local' ? '本地' : '远端' }}</q-badge>
+            </div>
+            <div class="conflict-reason">{{ conflict.reason === 'locked' ? '该内容已锁定，不能被覆盖' : '双方在离线期间都修改了同一字段' }}</div>
+            <div class="conflict-values">
+              <div class="conflict-value" :class="{ chosen: conflict.status === 'resolved' && conflict.resolution === 'local' }">
+                <span class="cv-label">本地（离线）</span>
+                <span class="cv-value">{{ formatValue(conflict.localValue) }}</span>
+                <q-btn v-if="conflict.status === 'open'" size="xs" outline color="primary" no-caps :disable="conflict.reason === 'locked'" label="采用本地" @click="resolveConflict(conflict.id, 'local')" />
+              </div>
+              <div class="conflict-value" :class="{ chosen: conflict.status === 'resolved' && conflict.resolution === 'server' }">
+                <span class="cv-label">远端（当前版本）</span>
+                <span class="cv-value">{{ formatValue(conflict.serverValue) }}</span>
+                <q-btn v-if="conflict.status === 'open'" size="xs" outline color="primary" no-caps label="采用远端" @click="resolveConflict(conflict.id, 'server')" />
+              </div>
+            </div>
+          </div>
+        </q-card-section>
+      </q-card>
+    </q-dialog>
   </q-layout>
 </template>
